@@ -147,6 +147,7 @@ func main() {
 	apiDir := flag.String("api-dir", "", "root of the API module to scan")
 	outDir := flag.String("out-dir", "./pkg/metrics", "root directory for generated output packages")
 	module := flag.String("module", "", "root Go module path")
+	goHeaderFile := flag.String("go-header-file", "", "path to a file containing a header to prepend to generated files")
 	flag.Parse()
 
 	if *apiDir == "" {
@@ -157,6 +158,16 @@ func main() {
 	if *module == "" {
 		fmt.Fprint(os.Stderr, "metrics-gen: module must be defined\n")
 		os.Exit(1)
+	}
+
+	var goHeader []byte
+	if *goHeaderFile != "" {
+		var err error
+		goHeader, err = os.ReadFile(*goHeaderFile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "metrics-gen: reading go-header-file: %v\n", err)
+			os.Exit(1)
+		}
 	}
 
 	absAPIDir, err := filepath.Abs(*apiDir)
@@ -224,7 +235,7 @@ func main() {
 				ConditionStatuses:  condStatusPkg.statuses,
 			}
 
-			if err := generateFile(absOutDir, m.ResourceType, data, tmpl); err != nil {
+			if err := generateFile(absOutDir, m.ResourceType, data, tmpl, goHeader); err != nil {
 				fmt.Fprintf(os.Stderr, "metrics-gen: generating %s: %v\n", m.ResourceType, err)
 				os.Exit(1)
 			}
@@ -540,13 +551,17 @@ func pathToAccessor(path string) string {
 }
 
 // generateFile renders the template and writes the output file.
-func generateFile(outDir, resourceType string, data templateData, tmpl *template.Template) error {
+func generateFile(outDir, resourceType string, data templateData, tmpl *template.Template, goHeader []byte) error {
 	destDir := filepath.Join(outDir, resourceType)
 	if err := os.MkdirAll(destDir, 0755); err != nil {
 		return err
 	}
 
 	var buf bytes.Buffer
+	buf.Write(goHeader)
+	if len(goHeader) > 0 {
+		buf.WriteString("\n")
+	}
 	if err := tmpl.Execute(&buf, data); err != nil {
 		return fmt.Errorf("template execution: %w", err)
 	}
