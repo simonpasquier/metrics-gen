@@ -38,9 +38,9 @@ package operator
 
 import (
 	"fmt"
+	"iter"
 
 	"github.com/prometheus/client_golang/prometheus"
-	"k8s.io/client-go/tools/cache"
 {{ if .SamePackage }}
 	{{ .TypePkgAlias }} "{{ .TypePkgImport }}"
 {{- else }}
@@ -50,12 +50,12 @@ import (
 )
 
 type conditionCollector struct {
-	stores []cache.Store
+	seq iter.Seq[*{{ .TypePkgAlias }}.{{ .ConcreteType }}]
 }
 
-func NewConditionCollector(stores ...cache.Store) prometheus.Collector {
+func NewConditionCollector(seq iter.Seq[*{{ .TypePkgAlias }}.{{ .ConcreteType }}]) prometheus.Collector {
 	return &conditionCollector{
-		stores: stores,
+		seq: seq,
 	}
 }
 
@@ -68,7 +68,7 @@ var conditionStatuses = []{{ .CondStatusAlias }}.ConditionStatus{
 }
 
 var conditionDesc = prometheus.NewDesc(
-	prometheus.BuildFQName("prometheus_operator", resourceType, "status_condition"),
+	prometheus.BuildFQName("{{ .MetricNamespace }}", resourceType, "status_condition"),
 	fmt.Sprintf("The current status conditions of a %s resource", resourceType),
 	[]string{"name", "namespace", "condition", "status"},
 	nil,
@@ -79,28 +79,25 @@ func (cc *conditionCollector) Describe(ch chan<- *prometheus.Desc) {
 }
 
 func (cc *conditionCollector) Collect(ch chan<- prometheus.Metric) {
-	for _, store := range cc.stores {
-		for _, obj := range store.List() {
-			o := obj.(*{{ .TypePkgAlias }}.{{ .ConcreteType }})
-			if o.DeletionTimestamp != nil {
-				continue
-			}
-			for _, cond := range o.{{ .ConditionsAccessor }} {
-				for _, s := range conditionStatuses {
-					v := 0
-					if cond.Status == s {
-						v = 1
-					}
-					ch <- prometheus.MustNewConstMetric(
-						conditionDesc,
-						prometheus.GaugeValue,
-						float64(v),
-						o.Name,
-						o.Namespace,
-						string(cond.Type),
-						string(s),
-					)
+	for o := range cc.seq {
+		if o.DeletionTimestamp != nil {
+			continue
+		}
+		for _, cond := range o.{{ .ConditionsAccessor }} {
+			for _, s := range conditionStatuses {
+				v := 0
+				if cond.Status == s {
+					v = 1
 				}
+				ch <- prometheus.MustNewConstMetric(
+					conditionDesc,
+					prometheus.GaugeValue,
+					float64(v),
+					o.Name,
+					o.Namespace,
+					string(cond.Type),
+					string(s),
+				)
 			}
 		}
 	}
@@ -109,6 +106,7 @@ func (cc *conditionCollector) Collect(ch chan<- prometheus.Metric) {
 
 type templateData struct {
 	ResourceType       string
+	MetricNamespace    string
 	ConcreteType       string
 	ConditionsAccessor string
 	// TypePkgAlias/Import: the package of the concrete resource type (e.g. monitoringv1alpha1).
@@ -147,6 +145,7 @@ func main() {
 	apiDir := flag.String("api-dir", "", "root of the API module to scan")
 	outDir := flag.String("out-dir", "./pkg/metrics", "root directory for generated output packages")
 	module := flag.String("module", "", "root Go module path")
+	metricNamespace := flag.String("metric-namespace", "", "namespace used as the first component of the metric name")
 	goHeaderFile := flag.String("go-header-file", "", "path to a file containing a header to prepend to generated files")
 	flag.Parse()
 
@@ -225,6 +224,7 @@ func main() {
 
 			data := templateData{
 				ResourceType:       m.ResourceType,
+				MetricNamespace:    *metricNamespace,
 				ConcreteType:       m.StructName,
 				ConditionsAccessor: pathToAccessor(m.ConditionsPath),
 				TypePkgAlias:       typePkgAlias,
