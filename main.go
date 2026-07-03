@@ -25,6 +25,9 @@ import (
 	"path/filepath"
 	"strings"
 	"text/template"
+
+	"golang.org/x/mod/modfile"
+	"golang.org/x/mod/module"
 )
 
 const markerPrefix = "+metrics:conditions:"
@@ -44,7 +47,8 @@ import (
 {{ if .SamePackage }}
 	{{ .TypePkgAlias }} "{{ .TypePkgImport }}"
 {{- else }}
-	{{ .CondStatusAlias }} "{{ .CondStatusImport }}"
+	{{- .CondStatusAlias }} "{{ .CondStatusImport }}"
+
 	{{ .TypePkgAlias }} "{{ .TypePkgImport }}"
 {{- end }}
 )
@@ -250,7 +254,7 @@ func readModulePath(goModPath string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	scanner := bufio.NewScanner(f)
 	for scanner.Scan() {
@@ -495,7 +499,11 @@ func resolveCondStatusPkg(path, startTypeName string, startPkg *packageInfo, cac
 			}
 			nextPkg, ok := cache[nextDir]
 			if !ok {
-				return nil, fmt.Errorf("package dir %s not in cache (import: %s)", nextDir, importPath)
+				nextPkg, err = loadPackageInfo(nextDir, importPath)
+				if err != nil {
+					return nil, fmt.Errorf("loading external package %s: %w", importPath, err)
+				}
+				cache[nextDir] = nextPkg
 			}
 			curPkg = nextPkg
 			curTypeName = t.Sel.Name
@@ -521,14 +529,85 @@ func findFieldByName(st *ast.StructType, name string) ast.Expr {
 	return nil
 }
 
-// importPathToDir converts an import path to its absolute directory under absAPIDir.
-// Only works for packages within the same sub-module.
+// importPathToDir converts an import path to its absolute directory.
+// It checks (in order): within the API module, vendor/, then the GOPATH module cache.
 func importPathToDir(importPath, absAPIDir, subModulePath string) (string, error) {
-	rel, ok := strings.CutPrefix(importPath, subModulePath+"/")
-	if !ok {
-		return "", fmt.Errorf("import %s is outside the API module %s", importPath, subModulePath)
+	// 1. Within the API module.
+	if rel, ok := strings.CutPrefix(importPath, subModulePath+"/"); ok {
+		return filepath.Join(absAPIDir, rel), nil
 	}
-	return filepath.Join(absAPIDir, rel), nil
+
+	// 2. Vendor directory adjacent to go.mod.
+	vendorDir := filepath.Join(absAPIDir, "vendor")
+	if _, err := os.Stat(vendorDir); err == nil {
+		dir := filepath.Join(vendorDir, filepath.FromSlash(importPath))
+		if _, err := os.Stat(dir); err == nil {
+			return dir, nil
+		}
+	}
+
+	// 3. GOPATH module cache resolved via go.mod require directives.
+	return resolveFromModuleCache(importPath, absAPIDir)
+}
+
+// resolveFromModuleCache finds importPath in the GOPATH module cache by reading
+// require directives from the go.mod in absAPIDir.
+func resolveFromModuleCache(importPath, absAPIDir string) (string, error) {
+	data, err := os.ReadFile(filepath.Join(absAPIDir, "go.mod"))
+	if err != nil {
+		return "", fmt.Errorf("reading go.mod to resolve external import: %w", err)
+	}
+	f, err := modfile.Parse("go.mod", data, nil)
+	if err != nil {
+		return "", fmt.Errorf("parsing go.mod: %w", err)
+	}
+
+	// Longest module-path prefix wins.
+	var bestMod, bestVer string
+	for _, req := range f.Require {
+		mod := req.Mod.Path
+		if (strings.HasPrefix(importPath, mod+"/") || importPath == mod) && len(mod) > len(bestMod) {
+			bestMod, bestVer = mod, req.Mod.Version
+		}
+	}
+	if bestMod == "" {
+		return "", fmt.Errorf("import %s not found in go.mod requires", importPath)
+	}
+
+	gopath := gopathDir()
+	if gopath == "" {
+		return "", fmt.Errorf("cannot determine GOPATH to resolve import %s", importPath)
+	}
+
+	escapedMod, err := module.EscapePath(bestMod)
+	if err != nil {
+		return "", fmt.Errorf("escaping module path %s: %w", bestMod, err)
+	}
+	escapedVer, err := module.EscapeVersion(bestVer)
+	if err != nil {
+		return "", fmt.Errorf("escaping module version %s: %w", bestVer, err)
+	}
+
+	rel := filepath.FromSlash(strings.TrimPrefix(strings.TrimPrefix(importPath, bestMod), "/"))
+	dir := filepath.Join(gopath, "pkg", "mod", escapedMod+"@"+escapedVer, rel)
+	if _, err := os.Stat(dir); err != nil {
+		return "", fmt.Errorf("module cache dir %s: %w", dir, err)
+	}
+	return dir, nil
+}
+
+// gopathDir returns the first GOPATH entry, defaulting to $HOME/go.
+func gopathDir() string {
+	if gp := os.Getenv("GOPATH"); gp != "" {
+		if first, _, ok := strings.Cut(gp, string(filepath.ListSeparator)); ok {
+			return first
+		}
+		return gp
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		return filepath.Join(home, "go")
+	}
+	return ""
 }
 
 // pkgAliasFromImport derives an import alias from the last two path components,
